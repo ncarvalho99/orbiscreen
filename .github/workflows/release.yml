@@ -102,6 +102,15 @@ jobs:
         run: |
           cargo build --release --workspace --locked
 
+      - name: Resolve release version
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            else
+            VERSION="$(sed -n 's/^pkgver=//p' PKGBUILD)"
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "Packaging version $VERSION"
+
       - name: Package Linux tarball
         run: |
           mkdir -p release-bundle/bin
@@ -154,7 +163,6 @@ jobs:
           RPM_GPG_NAME: ${{ secrets.RPM_GPG_NAME }}
         run: |
           chmod +x scripts/package-deb.sh
-          VERSION="${GITHUB_REF_NAME#v}"
           ./scripts/package-deb.sh "$VERSION"
           mv "orbiscreen_${VERSION}_amd64.deb" orbiscreen_amd64.deb
 
@@ -173,7 +181,6 @@ jobs:
           RPM_GPG_NAME: ${{ secrets.RPM_GPG_NAME }}
         run: |
           chmod +x scripts/package-rpm.sh
-          VERSION="${GITHUB_REF_NAME#v}"
           ./scripts/package-rpm.sh "$VERSION"
           mv "orbiscreen-${VERSION}-1.x86_64.rpm" orbiscreen_x86_64.rpm
 
@@ -190,16 +197,11 @@ jobs:
       - name: Package AppImage
         run: |
           chmod +x scripts/package-appimage.sh
-          VERSION="${GITHUB_REF_NAME#v}"
           ./scripts/package-appimage.sh "$VERSION"
           cp "dist/orbiscreen-${VERSION}-x86_64.AppImage" orbiscreen-x86_64.AppImage
 
       - name: Package Arch Linux package
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          if [ "$GITHUB_REF_TYPE" != "tag" ]; then
-            VERSION="$(sed -n 's/^pkgver=//p' PKGBUILD)"
-          fi
           mkdir -p archpkg
           # makepkg uses a source file already in the build dir instead of downloading
           # it, so the package is built from exactly this checkout.
@@ -264,7 +266,6 @@ jobs:
       - name: Extract Release Notes
         id: extract_notes
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
           awk -v ver="v$VERSION" '
             flag && /^## \[/ { flag = 0 }
             !flag && index($0, "## [" ver "]") == 1 { flag = 1; next }
