@@ -2694,6 +2694,7 @@ async fn run_secondary_display_session(
         height: actual_dims.1,
         framerate: spec.refresh_rate_hz,
         vbv_frames: 1,
+        drop_stale_frames: true,
     })?;
     let encoder_name = match encoder.kind() {
         EncoderKind::Auto => "auto",
@@ -3098,6 +3099,7 @@ async fn run_start(
         height: actual_dims.1,
         framerate: spec.refresh_rate_hz,
         vbv_frames: 1,
+        drop_stale_frames: true,
     })?;
     let encoder_name = match encoder.kind() {
         EncoderKind::Auto => "auto",

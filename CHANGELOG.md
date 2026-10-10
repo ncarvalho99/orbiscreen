@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.36.0.1] - 2026-10-10
+
+Fork release of [ncarvalho99/orbiscreen](https://github.com/ncarvalho99/orbiscreen) on top of upstream v0.36.0. Daemon-only change: use the upstream Android app v0.36.0.
+
+### Changed
+- fix: keep the streamed pointer responsive by never letting frames queue up between capture and encode
+
+On 0.31.x with a KWin virtual output at 2560x1600, the encoder could not keep up with capture and its `appsrc` queue was unbounded, so frames piled up in front of it (measured up to ~28 frames, about half a second). Video looked fine, but the pointer, the one thing driven live by the user, trailed visibly behind the hand. Upstream v0.36.0 no longer builds that backlog in normal use (measured 0 queued frames), so this release keeps the pipeline bounded for when the encoder does fall behind (load, higher resolutions, slower GPUs) rather than relying on it never happening.
+
+- The encoder `appsrc` holds at most one raw frame and drops the oldest when full (`leaky-type=downstream`, `max-buffers=1`), via the new `EncodeParams::drop_stale_frames` (on by default; the MPEG-TS mux test turns it off because it needs every frame)
+- KWin virtual capture hands frames to the daemon through a single-slot mailbox that always keeps the newest frame, instead of an 8-deep channel that dropped the newest frame when full
+- The per-client capture pump no longer sleeps to pace frames; frames arriving earlier than 3/4 of the refresh interval are skipped, and the keepalive copy always holds the newest frame so a keepalive replay never shows an older pointer position
+- The KWin damage pump re-damages on `wl_surface.frame` callbacks, so it follows the virtual output's own repaint loop instead of a free-running timer (the timer remains as a fallback)
+- New opt-in `ORBISCREEN_KWIN_DMABUF=1`: KWin hands over DMA-BUF and `vapostproc` produces the BGRA copy, skipping KWin's synchronous GPU->SHM readback. On 0.31.x it raised a 2560x1600 output from ~42 to ~53 fps; on 0.36.0 it costs ~3 fps, so it is off by default
+
+Measured on a Ryzen 7 7735HS / Radeon 680M, KDE Plasma 6.7.5 Wayland, Redmi Pad Pro over USB (AOA), 2560x1600, pointer moving continuously:
+
+| | upstream v0.36.0 | v0.36.0.1 |
+|---|---|---|
+| frames/s at the tablet decoder | ~53 | ~53 |
+| decoder latency | 18 ms | 18-19 ms |
+| raw frames that can queue before the encoder | unbounded | 1 |
+
 ## [v0.36.0] - 2026-10-09
 
 ### Changed

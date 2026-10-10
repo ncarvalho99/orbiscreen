@@ -653,6 +653,7 @@ async fn open_session(
         height: actual_h,
         framerate: refresh_hz,
         vbv_frames: 1,
+        drop_stale_frames: true,
     })
     .map_err(|e| e.to_string())?;
     let encoder_name = encoder_label(encoder.kind());
@@ -739,7 +740,7 @@ fn spawn_capture_pump(
         let started = std::time::Instant::now();
         let mut last_pts_ns: u64 = 0;
         let mut keepalive_frame: Option<(u32, u32, Vec<u8>)> = None;
-        let mut next_frame_target_ns = started.elapsed().as_nanos() as u64;
+        let mut last_push_ns: Option<u64> = None;
         loop {
             if *shutdown.borrow() {
                 break;
@@ -750,8 +751,18 @@ fn spawn_capture_pump(
             };
             match outcome {
                 Ok(Ok(frame)) => {
+                    // Always keep the newest frame for keepalive replay, so a replay never
+                    // shows an older cursor position than what the client already saw.
                     keepalive_frame = Some((frame.width, frame.height, frame.data.to_vec()));
                     let now_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                    // Cap the encode rate at refresh_hz without queueing: a frame arriving
+                    // early is skipped (a fresher one follows) instead of being delayed.
+                    if last_push_ns
+                        .is_some_and(|t| now_ns.saturating_sub(t) < frame_interval_ns * 3 / 4)
+                    {
+                        continue;
+                    }
+                    last_push_ns = Some(now_ns);
                     let pts_ns = now_ns.max(last_pts_ns.saturating_add(1_000));
                     last_pts_ns = pts_ns;
                     if let Err(e) =
@@ -761,13 +772,6 @@ fn spawn_capture_pump(
                             orbiscreen_encode::EncodeError::Flushing
                             | orbiscreen_encode::EncodeError::Eos => break,
                             _ => warn!("frame push rejected: {e}"),
-                        }
-                    }
-                    next_frame_target_ns += frame_interval_ns;
-                    if next_frame_target_ns > now_ns {
-                        let sleep_ns = next_frame_target_ns - now_ns;
-                        if sleep_ns > 1_000_000 {
-                            tokio::time::sleep(std::time::Duration::from_nanos(sleep_ns)).await;
                         }
                     }
                 }
@@ -789,13 +793,7 @@ fn spawn_capture_pump(
                     {
                         break;
                     }
-                    next_frame_target_ns += frame_interval_ns;
-                    if next_frame_target_ns > now_ns {
-                        let sleep_ns = next_frame_target_ns - now_ns;
-                        if sleep_ns > 1_000_000 {
-                            tokio::time::sleep(std::time::Duration::from_nanos(sleep_ns)).await;
-                        }
-                    }
+                    last_push_ns = Some(now_ns);
                 }
             }
         }

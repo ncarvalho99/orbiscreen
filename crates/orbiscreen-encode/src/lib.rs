@@ -53,6 +53,9 @@ pub struct EncodeParams {
     pub height: u32,
     pub framerate: u32,
     pub vbv_frames: u32,
+    /// Live streaming: keep at most one raw frame queued and drop the oldest when the
+    /// encoder falls behind, so its slowness never turns into growing latency.
+    pub drop_stale_frames: bool,
 }
 
 impl Default for EncodeParams {
@@ -64,6 +67,7 @@ impl Default for EncodeParams {
             height: 1080,
             framerate: 60,
             vbv_frames: 1,
+            drop_stale_frames: true,
         }
     }
 }
@@ -383,6 +387,12 @@ impl Encoder {
         appsrc.set_is_live(true);
         appsrc.set_do_timestamp(false);
         appsrc.set_max_bytes((params.width as u64) * params.height as u64 * 4);
+        // An unbounded live queue turns encoder slowness into growing latency
+        // (measured: ~28 queued 2560x1600 frames, about half a second of pointer lag).
+        if params.drop_stale_frames && appsrc.find_property("leaky-type").is_some() {
+            appsrc.set_property_from_str("leaky-type", "downstream");
+            appsrc.set_property("max-buffers", 1u64);
+        }
 
         if encoder.find_property("bitrate").is_some() {
             encoder.set_property_from_str("bitrate", &params.bitrate_kbps.to_string());
@@ -805,6 +815,7 @@ mod tests {
             height: 64,
             framerate: 60,
             vbv_frames: 1,
+            drop_stale_frames: true,
         }) {
             Ok(enc) => Some(enc),
             Err(e) => {
@@ -946,6 +957,7 @@ mod tests {
             height: 64,
             framerate: 30,
             vbv_frames: 1,
+            drop_stale_frames: true,
         });
         if let Ok(encoder) = encoder {
             encoder.request_keyframe();
@@ -963,6 +975,7 @@ mod tests {
             height: 64,
             framerate: 30,
             vbv_frames: 1,
+            drop_stale_frames: true,
         }) {
             Ok(e) => e,
             Err(_) => return,

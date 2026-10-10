@@ -159,13 +159,13 @@ jobs:
           mv "orbiscreen_${VERSION}_amd64.deb" orbiscreen_amd64.deb
 
           if [ -z "$RPM_GPG_KEY" ] || [ -z "$RPM_GPG_NAME" ]; then
-            echo "::error::RPM_GPG_KEY / RPM_GPG_NAME secrets are not set; cannot sign the DEB"
-            exit 1
+            echo "::warning::RPM_GPG_KEY / RPM_GPG_NAME secrets are not set; publishing the DEB unsigned"
+          else
+            echo "Signing DEB package..."
+            sudo apt-get install -y debsigs gnupg2
+            echo "$RPM_GPG_KEY" | gpg2 --import
+            debsigs --sign=origin --default-key="$RPM_GPG_NAME" orbiscreen_amd64.deb
           fi
-          echo "Signing DEB package..."
-          sudo apt-get install -y debsigs gnupg2
-          echo "$RPM_GPG_KEY" | gpg2 --import
-          debsigs --sign=origin --default-key="$RPM_GPG_NAME" orbiscreen_amd64.deb
 
       - name: Package RPM package
         env:
@@ -178,14 +178,14 @@ jobs:
           mv "orbiscreen-${VERSION}-1.x86_64.rpm" orbiscreen_x86_64.rpm
 
           if [ -z "$RPM_GPG_KEY" ] || [ -z "$RPM_GPG_NAME" ]; then
-            echo "::error::RPM_GPG_KEY / RPM_GPG_NAME secrets are not set; cannot sign the RPM"
-            exit 1
+            echo "::warning::RPM_GPG_KEY / RPM_GPG_NAME secrets are not set; publishing the RPM unsigned"
+          else
+            echo "Signing RPM package..."
+            sudo apt-get install -y rpm gnupg2
+            echo "$RPM_GPG_KEY" | gpg2 --import
+            echo "%_gpg_name $RPM_GPG_NAME" >> ~/.rpmmacros
+            rpmsign --addsign orbiscreen_x86_64.rpm
           fi
-          echo "Signing RPM package..."
-          sudo apt-get install -y rpm gnupg2
-          echo "$RPM_GPG_KEY" | gpg2 --import
-          echo "%_gpg_name $RPM_GPG_NAME" >> ~/.rpmmacros
-          rpmsign --addsign orbiscreen_x86_64.rpm
 
       - name: Package AppImage
         run: |
@@ -193,6 +193,28 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           ./scripts/package-appimage.sh "$VERSION"
           cp "dist/orbiscreen-${VERSION}-x86_64.AppImage" orbiscreen-x86_64.AppImage
+
+      - name: Package Arch Linux package
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [ "$GITHUB_REF_TYPE" != "tag" ]; then
+            VERSION="$(sed -n 's/^pkgver=//p' PKGBUILD)"
+          fi
+          mkdir -p archpkg
+          # makepkg uses a source file already in the build dir instead of downloading
+          # it, so the package is built from exactly this checkout.
+          git archive --format=tar.gz --prefix="orbiscreen-${VERSION}/" \
+            -o "archpkg/orbiscreen-${VERSION}.tar.gz" HEAD
+          sed "s/^pkgver=.*/pkgver=${VERSION}/" PKGBUILD > archpkg/PKGBUILD
+          docker run --rm -v "$PWD/archpkg:/pkg" archlinux:base-devel bash -euc '
+            pacman -Syu --noconfirm --needed cargo git pkgconf python gtk3 webkit2gtk-4.1 \
+              gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad \
+              libevdev libxkbcommon hicolor-icon-theme
+            useradd -m builder
+            chown -R builder /pkg
+            su builder -c "cd /pkg && makepkg -f --nocheck --noconfirm"
+          '
+          cp archpkg/orbiscreen-"${VERSION}"-*-x86_64.pkg.tar.zst orbiscreen-x86_64.pkg.tar.zst
 
       - name: Set up JDK 17 for Android
         uses: actions/setup-java@3a4f6e1af504cf6a31855fa899c6aa5355ba6c12 # v4.7.0
@@ -210,8 +232,8 @@ jobs:
         run: |
           cd clients/android
           if [ -z "${ORBISCREEN_KEYSTORE_B64:-}" ]; then
-            echo "::error::ANDROID_KEYSTORE_B64 secret is not set in the repository"
-            exit 1
+            echo "::warning::ANDROID_KEYSTORE_B64 is not set; skipping the APK (use the upstream app)"
+            exit 0
           fi
           umask 077
           echo "$ORBISCREEN_KEYSTORE_B64" | base64 -d > /tmp/orbiscreen-release.keystore
@@ -234,7 +256,10 @@ jobs:
           sha256sum orbiscreen_amd64.deb > orbiscreen_amd64.deb.sha256
           sha256sum orbiscreen_x86_64.rpm > orbiscreen_x86_64.rpm.sha256
           sha256sum orbiscreen-x86_64.AppImage > orbiscreen-x86_64.AppImage.sha256
-          sha256sum orbiscreen-android-release.apk > orbiscreen-android-release.apk.sha256
+          sha256sum orbiscreen-x86_64.pkg.tar.zst > orbiscreen-x86_64.pkg.tar.zst.sha256
+          if [ -f orbiscreen-android-release.apk ]; then
+            sha256sum orbiscreen-android-release.apk > orbiscreen-android-release.apk.sha256
+          fi
 
       - name: Extract Release Notes
         id: extract_notes
@@ -247,7 +272,7 @@ jobs:
           ' CHANGELOG.md > release_notes.txt
           if [ ! -s release_notes.txt ]; then
             echo "release_notes.txt is empty - no CHANGELOG entry found for v$VERSION; using fallback notes"
-            printf 'Orbiscreen %s\n\nSee https://github.com/shadow-x78/orbiscreen/blob/main/CHANGELOG.md for details.\n' "v$VERSION" > release_notes.txt
+            printf 'Orbiscreen %s\n\nSee https://github.com/ncarvalho99/orbiscreen/blob/main/CHANGELOG.md for details.\n' "v$VERSION" > release_notes.txt
           fi
           cat release_notes.txt
 
@@ -259,7 +284,7 @@ jobs:
             orbiscreen_amd64.deb
             orbiscreen_x86_64.rpm
             orbiscreen-*.AppImage
-            orbiscreen-android-release.apk
+            orbiscreen-x86_64.pkg.tar.zst
 
       - name: Publish GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
@@ -290,9 +315,12 @@ jobs:
             "orbiscreen_x86_64.rpm.sha256"
             "orbiscreen-x86_64.AppImage"
             "orbiscreen-x86_64.AppImage.sha256"
-            "orbiscreen-android-release.apk"
-            "orbiscreen-android-release.apk.sha256"
+            "orbiscreen-x86_64.pkg.tar.zst"
+            "orbiscreen-x86_64.pkg.tar.zst.sha256"
           )
+          if [ -f orbiscreen-android-release.apk ]; then
+            RELEASE_ASSETS+=("orbiscreen-android-release.apk" "orbiscreen-android-release.apk.sha256")
+          fi
 
           for asset in "${RELEASE_ASSETS[@]}"; do
             echo "Uploading $asset..."

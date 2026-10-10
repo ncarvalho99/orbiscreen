@@ -22,6 +22,8 @@ fn encode_frames(pts_base: u64) -> Option<Vec<(Vec<u8>, bool, u64)>> {
         height: H,
         framerate: FPS,
         bitrate_kbps: 400,
+        // The test needs every pushed frame back out of the muxer.
+        drop_stale_frames: false,
         ..Default::default()
     }) {
         Ok(e) => e,

@@ -9,7 +9,6 @@ use std::time::{Duration, Instant};
 use gstreamer::prelude::*;
 use gstreamer_app::{AppSink, AppSinkCallbacks};
 use thiserror::Error;
-use tokio::sync::mpsc;
 use tokio::sync::Notify;
 use tracing::instrument;
 use wayland_client::backend::WaylandError;
@@ -23,8 +22,6 @@ use wayland_protocols_plasma::screencast::v1::client::zkde_screencast_unstable_v
 use super::{sample_to_captured_frame, CaptureError, CapturedFrame};
 
 const POINTER_EMBEDDED: u32 = 2;
-
-const FRAME_CHANNEL_CAPACITY: usize = 8;
 
 const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(5);
 const EVENT_POLL_TIMEOUT_MS: i32 = 100;
@@ -652,7 +649,8 @@ fn ensure_kwin_permission_file() {
 pub struct KwinVirtualCapture {
     _pipeline: gstreamer::Pipeline,
     stream: ZkdeScreencastStreamUnstableV1,
-    rx: tokio::sync::Mutex<mpsc::Receiver<CapturedFrame>>,
+    latest: Arc<Mutex<Option<CapturedFrame>>>,
+    frame_ready: Arc<Notify>,
     width: u32,
     height: u32,
     connector: String,
@@ -836,15 +834,33 @@ impl KwinVirtualCapture {
             }
         };
 
-        let pipeline_str = format!(
-            "pipewiresrc path={node_id} do-timestamp=true \
+        // Opt-in: ask KWin for DMA-BUF and let the GPU (vapostproc) produce the BGRA
+        // copy instead of KWin's synchronous GPU->SHM readback. It lifts the frame rate
+        // where that readback is the bottleneck (seen on 0.31.x at 2560x1600) but costs
+        // a few fps where it is not, so it stays behind ORBISCREEN_KWIN_DMABUF=1.
+        let use_dmabuf = std::env::var_os("ORBISCREEN_KWIN_DMABUF").is_some()
+            && gstreamer::ElementFactory::find("vapostproc").is_some();
+        let pipeline_str = if use_dmabuf {
+            format!(
+                "pipewiresrc path={node_id} do-timestamp=true always-copy=false \
+             ! video/x-raw(memory:DMABuf) \
+             ! vapostproc \
+             ! video/x-raw,format=BGRA,width={},height={} \
+             ! appsink name=sink drop=true sync=false max-buffers=1 emit-signals=false",
+                spec.width, spec.height
+            )
+        } else {
+            format!(
+                "pipewiresrc path={node_id} do-timestamp=true \
              ! video/x-raw \
              ! videoconvert n-threads=4 \
              ! videoscale \
              ! video/x-raw,format=BGRA,width={},height={} \
              ! appsink name=sink drop=true sync=false max-buffers=1 emit-signals=false",
-            spec.width, spec.height
-        );
+                spec.width, spec.height
+            )
+        };
+        tracing::info!(use_dmabuf, "KWin capture pipeline configured");
         let pipeline = gstreamer::parse::launch(&pipeline_str)
             .map_err(|e| KwinVirtualError::Wayland(format!("gst launch: {e}")))?
             .downcast::<gstreamer::Pipeline>()
@@ -856,7 +872,11 @@ impl KwinVirtualCapture {
             .downcast::<AppSink>()
             .map_err(|_| KwinVirtualError::Wayland("appsink downcast".into()))?;
 
-        let (tx, rx) = mpsc::channel::<CapturedFrame>(FRAME_CHANNEL_CAPACITY);
+        // Single-slot mailbox: a new frame always replaces an unconsumed one, so the
+        // encoder never works on a stale frame (dropping the newest adds input lag).
+        let latest: Arc<Mutex<Option<CapturedFrame>>> = Arc::new(Mutex::new(None));
+        let frame_ready = Arc::new(Notify::new());
+        let (slot, ready) = (Arc::clone(&latest), Arc::clone(&frame_ready));
         let pool = orbiscreen_core::frame_pool::FramePool::new();
         appsink.set_callbacks(
             AppSinkCallbacks::builder()
@@ -869,9 +889,14 @@ impl KwinVirtualCapture {
                         }
                     };
                     if let Some(frame) = sample_to_captured_frame(&sample, &pool) {
-                        if tx.try_send(frame).is_err() {
-                            tracing::debug!("capture frame dropped: consumer channel full");
+                        let stale = slot
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .replace(frame);
+                        if stale.is_some() {
+                            tracing::trace!("capture frame superseded before encode");
                         }
+                        ready.notify_one();
                     }
                     Ok(gstreamer::FlowSuccess::Ok)
                 })
@@ -937,7 +962,8 @@ impl KwinVirtualCapture {
         Ok(Self {
             _pipeline: pipeline,
             stream,
-            rx: tokio::sync::Mutex::new(rx),
+            latest,
+            frame_ready,
             width: spec.width,
             height: spec.height,
             connector: accepted_name.unwrap_or_else(|| VIRTUAL_OUTPUT_CONNECTOR.to_string()),
@@ -962,22 +988,17 @@ impl KwinVirtualCapture {
     }
 
     pub async fn next_frame(&self) -> Result<CapturedFrame, CaptureError> {
-        let mut rx = self.rx.lock().await;
         loop {
             if self.ended.load(Ordering::Relaxed) {
                 return Err(CaptureError::Io(
                     "KWin virtual output stream was closed".into(),
                 ));
             }
+            if let Some(frame) = self.latest.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                return Ok(frame);
+            }
             tokio::select! {
-                frame = rx.recv() => {
-                    return match frame {
-                        Some(frame) => Ok(frame),
-                        None => Err(CaptureError::Io(
-                            "KWin virtual output pipeline closed".into(),
-                        )),
-                    };
-                }
+                _ = self.frame_ready.notified() => continue,
                 _ = self.ended_notify.notified() => continue,
             }
         }

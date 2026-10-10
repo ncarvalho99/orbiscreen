@@ -1,16 +1,17 @@
 # ─────────────────────────────────────────────
-# Orbiscreen - AUR PKGBUILD
-# https://github.com/shadow-x78/orbiscreen
+# Orbiscreen - Arch Linux PKGBUILD (low-latency fork)
+# https://github.com/ncarvalho99/orbiscreen
+# Upstream: https://github.com/shadow-x78/orbiscreen
 # ─────────────────────────────────────────────
 
 # Maintainer: shadow-x78 <107577376+shadow-x78@users.noreply.github.com>
 
 pkgname=orbiscreen
-pkgver=0.36.0
+pkgver=0.36.0.1
 pkgrel=1
 pkgdesc="Turn Android devices into high-performance secondary monitors for Linux (Wayland & X11)"
 arch=('x86_64')
-url="https://github.com/shadow-x78/orbiscreen"
+url="https://github.com/ncarvalho99/orbiscreen"
 license=('GPL-3.0-or-later')
 depends=(
     'gstreamer'

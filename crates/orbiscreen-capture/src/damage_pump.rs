@@ -4,7 +4,8 @@ use std::time::Duration;
 
 use std::os::fd::AsFd as _;
 use wayland_client::protocol::{
-    wl_buffer, wl_compositor, wl_output, wl_region, wl_registry, wl_shm, wl_shm_pool, wl_surface,
+    wl_buffer, wl_callback, wl_compositor, wl_output, wl_region, wl_registry, wl_shm, wl_shm_pool,
+    wl_surface,
 };
 use wayland_client::{Connection, Dispatch, QueueHandle};
 use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::Anchor;
@@ -249,36 +250,69 @@ fn run(
 
     surface.attach(Some(&buffer_a), 0, 0);
     surface.damage_buffer(0, 0, width, height);
+    surface.frame(&qh, ());
     surface.commit();
 
+    // Re-damage as soon as KWin presents the previous frame (wl_surface.frame), so the
+    // virtual output repaints on every vblank of its own render loop. A free-running
+    // timer beats against that loop and loses frames; `period` is only a fallback.
     let mut flip = false;
-    let mut next_commit = std::time::Instant::now();
     loop {
         if stop.load(Ordering::Relaxed) {
             return Ok(());
         }
-        next_commit += period;
-        let now = std::time::Instant::now();
-        if next_commit > now {
-            std::thread::sleep(next_commit - now);
-        } else {
-            next_commit = std::time::Instant::now();
-        }
-        if stop.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-        queue
-            .dispatch_pending(&mut state)
-            .map_err(|e| format!("dispatch: {e}"))?;
-        let _ = conn.flush();
+        wait_for_frame_done(&conn, &mut queue, &mut state, period * 2, &stop)?;
         if state.closed {
             return Err("layer surface closed by compositor".into());
         }
+        state.frame_done = false;
         let next = if flip { &buffer_a } else { &buffer_b };
         surface.attach(Some(next), 0, 0);
         surface.damage_buffer(0, 0, width, height);
+        surface.frame(&qh, ());
         surface.commit();
+        let _ = conn.flush();
         flip = !flip;
+    }
+}
+
+#[allow(unsafe_code)]
+fn wait_for_frame_done(
+    conn: &Connection,
+    queue: &mut wayland_client::EventQueue<PumpState>,
+    state: &mut PumpState,
+    timeout: Duration,
+    stop: &AtomicBool,
+) -> Result<(), String> {
+    use std::os::fd::AsRawFd as _;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        queue
+            .dispatch_pending(state)
+            .map_err(|e| format!("dispatch: {e}"))?;
+        if state.frame_done || state.closed || stop.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return Ok(());
+        }
+        let _ = conn.flush();
+        let Some(guard) = queue.prepare_read() else {
+            continue;
+        };
+        let mut pfd = libc::pollfd {
+            fd: guard.connection_fd().as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let wait_ms = i32::try_from((deadline - now).as_millis().max(1)).unwrap_or(i32::MAX);
+        // SAFETY: `pfd` is a valid, initialised pollfd that outlives the call, and the
+        // count of 1 matches the single entry passed.
+        let ready = unsafe { libc::poll(&mut pfd, 1, wait_ms) };
+        if ready > 0 {
+            guard.read().map_err(|e| format!("read events: {e}"))?;
+        }
     }
 }
 
@@ -297,6 +331,7 @@ fn anonymous_shm_file() -> Result<std::fs::File, String> {
 #[derive(Default)]
 struct PumpState {
     configured: Option<(u32, i32, i32)>,
+    frame_done: bool,
     output_names: Vec<(wl_output::WlOutput, String)>,
     closed: bool,
 }
@@ -319,6 +354,21 @@ impl Dispatch<wl_registry::WlRegistry, wayland_client::globals::GlobalListConten
             if interface == "wl_output" {
                 let _: wl_output::WlOutput = registry.bind(name, version.min(4), qh, ());
             }
+        }
+    }
+}
+
+impl Dispatch<wl_callback::WlCallback, ()> for PumpState {
+    fn event(
+        state: &mut Self,
+        _: &wl_callback::WlCallback,
+        event: wl_callback::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_callback::Event::Done { .. } = event {
+            state.frame_done = true;
         }
     }
 }
